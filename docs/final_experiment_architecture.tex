@@ -1,0 +1,770 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue, citecolor=blue}
+
+\title{Final Experiment Architecture Notes\\Hybrid Generator, D\_WER, and Training Objectives}
+\author{AME Project Notes}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Purpose of this document}
+This document is a technical reference for the final AME experiments. It has four goals:
+\begin{enumerate}[leftmargin=*]
+    \item Describe the complete speech enhancement pipeline at a high level.
+    \item Define the mathematical notation used by the generator, the WER discriminator, and the training losses.
+    \item Explain why each component is useful, what failure mode it addresses, and what tradeoff it introduces.
+    \item Justify the new hybrid generator that combines a gain head and an additive residual head.
+\end{enumerate}
+
+The implementation corresponding to these notes is in:
+\begin{itemize}[leftmargin=*]
+    \item \texttt{models/generator.py}
+    \item \texttt{models/wer\_discriminator.py}
+    \item \texttt{trainers/trainer\_pretrain.py}
+    \item \texttt{trainers/trainer\_adv.py}
+    \item \texttt{trainers/trainer\_finetune.py}
+    \item \texttt{trainers/trainer\_werd.py}
+    \item \texttt{engine/losses.py}
+    \item \texttt{engine/validation.py}
+    \item \texttt{utils/data.py}
+\end{itemize}
+
+\section{What is actually used in the final experiments}
+This document describes the full design space implemented in the codebase. However, not every available component is active in the final experiment. To avoid ambiguity, this section explicitly separates:
+\begin{enumerate}[leftmargin=*]
+    \item the \textbf{main final baseline}, and
+    \item the \textbf{final hybrid ablation}.
+\end{enumerate}
+
+\subsection{Main final baseline}
+The main final baseline corresponds to:
+\begin{itemize}[leftmargin=*]
+    \item \texttt{config.hpc.dwer\_acoustic\_final\_fix.yaml}
+\end{itemize}
+
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.34\linewidth} >{\raggedright\arraybackslash}p{0.14\linewidth} >{\raggedright\arraybackslash}p{0.42\linewidth}}
+\toprule
+Component / choice & Status & Notes \\
+\midrule
+\endfirsthead
+\toprule
+Component / choice & Status & Notes \\
+\midrule
+\endhead
+Generator output mode & Used & \texttt{mask\_residual} (legacy conservative output). \\
+Hybrid gain + residual output & Not used & Reserved for the dedicated hybrid experiment. \\
+D\_WER absolute head for validation / scoring & Used & \texttt{validation\_head=abs}. \\
+D\_WER relative head for validation / scoring & Not used & Available in code, not selected in final baseline. \\
+Quantile log-WER target for D\_WER & Used & \texttt{target\_mode=quantile\_logwer}. \\
+Relative listwise ranking loss for D\_WER & Used & \texttt{loss\_mode=relative\_listwise}. \\
+Acoustic mel-CNN branch in D\_WER & Used & \texttt{use\_acoustic\_branch=true}. \\
+Waveform multi-scale branch in D\_WER & Not used & Implemented, disabled in final baseline. \\
+Domain calibration in D\_WER & Not used & Empirically worse in current setup. \\
+Replay buffer for D\_WER & Used & \texttt{use\_replay=true}. \\
+WER filter for D\_WER train/eval & Used & Train/eval filter set to 20.0. \\
+WER filter for G finetune train & Used & \texttt{train\_wer\_filter\_max=10.0}. \\
+Chunked paired generator pretrain & Not used & Main final baseline keeps paired pretrain without explicit train-time cropping. \\
+Validation schedule & Used & Quick validation with 32 samples, full validation with 64 samples every 5 epochs. \\
+MRSTFT anchor in finetune & Used & \texttt{stft\_anchor\_weight=0.03}. \\
+Identity L1 anchor in finetune & Not used & \texttt{identity\_l1\_weight=0.0}. \\
+Semantic anchor in finetune & Not used & \texttt{use\_semantic\_anchor=false}. \\
+WER adversarial finetune loss & Used & Enabled in finetune. \\
+WER adversarial head & Used & \texttt{wer\_adv\_head=abs}. \\
+WER adversarial mode & Used & \texttt{pairwise\_margin}. \\
+Absolute margin adversarial mode & Not used & Available in code, not used in final baseline. \\
+GAN discriminator stage & Not used in main final experiment & Implemented in codebase, but not part of the main final recommendation here. \\
+Precomputed noisy WER during validation & Not used & \texttt{use\_precomputed\_noisy\_wer=false}. \\
+Per-sample WER cap in validation metrics & Used & \texttt{per\_sample\_wer\_cap=5.0}; reporting only, not training. \\
+\bottomrule
+\end{longtable}
+
+\subsection{Final hybrid ablation}
+The hybrid ablation corresponds to:
+\begin{itemize}[leftmargin=*]
+    \item \texttt{config.hpc.dwer\_acoustic\_final\_hybrid.yaml}
+\end{itemize}
+
+This experiment keeps the same discriminator and training strategy as the main final baseline, but changes the generator output mode:
+\begin{align}
+    \texttt{output\_mode} = \texttt{hybrid\_gain\_residual}.
+\end{align}
+
+Everything else should remain as close as possible to the main baseline. The purpose of this ablation is to isolate the effect of the new generator output parameterization.
+
+The hybrid ablation also activates one practical memory-control change during paired pretraining:
+\begin{itemize}[leftmargin=*]
+    \item \texttt{pretrain.train\_chunk\_seconds = 8.0}
+    \item \texttt{pretrain.train\_random\_chunk = true}
+    \item \texttt{pretrain.oom\_chunk\_backoff = 0.85}
+    \item \texttt{pretrain.oom\_min\_chunk\_seconds = 4.0}
+\end{itemize}
+This chunking change is a training-time engineering safeguard for the hybrid run on the available GPU budget; it is not part of the conceptual discriminator ablation.
+
+\section{Global pipeline}
+The project has two main models:
+\begin{enumerate}[leftmargin=*]
+    \item A generator $G_{\theta}$ that transforms a noisy telephone waveform into an enhanced waveform.
+    \item A WER discriminator $D_{\phi}$ that estimates a quality proxy derived from ASR difficulty.
+\end{enumerate}
+
+At a high level, the pipeline is:
+\begin{align}
+    x_N &\in \mathbb{R}^{T} && \text{noisy input waveform} \\
+    x_P &= G_{\theta}(x_N) && \text{predicted/enhanced waveform} \\
+    s(x) &= D_{\phi}(x) && \text{discriminator score} \\
+    \hat{q}_T(x) &= \sigma(s(x)) && \text{predicted quality proxy in } [0,1].
+\end{align}
+
+The discriminator is trained from targets derived from WER or log-WER statistics. The generator is trained either with paired objectives (pretrain / GAN stage) or with self-anchored and discriminator-guided objectives (finetune stage).
+
+\section{Notation}
+We use the following notation throughout the document.
+
+\subsection{Signals}
+\begin{align}
+    x_N &:& \text{noisy waveform} \\
+    x_C &:& \text{clean waveform, when paired supervision exists} \\
+    x_P &:& \text{predicted waveform, } x_P = G_{\theta}(x_N).
+\end{align}
+
+\subsection{Quality variables}
+Let $w(x)$ denote a WER-like scalar associated with waveform $x$.
+
+We define:
+\begin{align}
+    q_T(x) &:& \text{target quality derived from WER or a calibrated transform} \\
+    \hat{q}_T(x) &:& \text{quality approximation produced by the discriminator} \\
+    q_P &:= \hat{q}_T(x_P) && \text{predicted quality of the enhanced waveform} \\
+    q_N &:= \hat{q}_T(x_N) && \text{predicted quality of the noisy waveform.}
+\end{align}
+
+In practice, the discriminator also works with logits or rank scores. Therefore it is useful to distinguish:
+\begin{align}
+    s(x) &= D_{\phi}(x) && \text{raw score/logit} \\
+    \hat{q}_T(x) &= \sigma(s(x)) = \frac{1}{1 + e^{-s(x)}}.
+\end{align}
+
+\section{Generator architecture}
+
+\subsection{Backbone}
+The generator in \texttt{models/generator.py} is a 1D U-Net-like architecture composed of:
+\begin{enumerate}[leftmargin=*]
+    \item Input projection from 1 channel to $C$ channels.
+    \item A stack of strided downsampling blocks.
+    \item A bottleneck of residual blocks.
+    \item A symmetric upsampling path with skip connections.
+    \item A final refinement stage before the output head(s).
+\end{enumerate}
+
+If we denote the encoded representation before the output layer by $h \in \mathbb{R}^{C \times T}$, then the output head determines how the waveform is reconstructed.
+
+\paragraph{Status in the main final baseline}
+The backbone itself is used in the final experiment. What changes across experiments is only the output parameterization.
+
+\subsection{Legacy generator: residual masking}
+The original generator output is a single mask:
+\begin{align}
+    m &= \tanh(W_m * h + b_m), \\
+    x_P &= x_N + \alpha \,(m \odot x_N),
+\end{align}
+where $\alpha > 0$ is a small scale factor and $\odot$ denotes elementwise multiplication.
+
+In the current code, this corresponds to:
+\begin{align}
+    x_P = x_N + \alpha \; m \odot x_N,
+\end{align}
+with default $\alpha = 0.5$.
+
+\paragraph{Why this design is attractive}
+\begin{itemize}[leftmargin=*]
+    \item It is conservative. The model modifies the input without being free to hallucinate arbitrary waveform content.
+    \item It is stable under weak supervision and identity-like training setups.
+    \item It naturally preserves coarse waveform structure because every correction is tied to the input sample values.
+\end{itemize}
+
+\paragraph{Its main limitation}
+The masking form cannot easily recover information in regions where the input amplitude is already too small or too distorted. If $x_N(t) \approx 0$, then:
+\begin{align}
+    x_P(t) \approx x_N(t) + \alpha m(t) x_N(t) \approx 0,
+\end{align}
+so the model has almost no additive freedom to correct the sample.
+
+This is acceptable when the problem is mostly reweighting or mild denoising, but it becomes restrictive when the model must actively reconstruct missing or heavily corrupted fine structure.
+
+\paragraph{Status in the main final baseline}
+This is the generator output used in the main final baseline.
+
+\subsection{New generator: hybrid gain + residual}
+The new generator introduces two output heads:
+\begin{align}
+    g &= 1 + \beta \tanh(W_g * h + b_g), \\
+    \delta &= \gamma \tanh(W_{\delta} * h + b_{\delta}), \\
+    x_P &= g \odot x_N + \delta.
+\end{align}
+
+Here:
+\begin{align}
+    g &:& \text{multiplicative gain field} \\
+    \delta &:& \text{additive correction field} \\
+    \beta &:& \text{gain scale} \\
+    \gamma &:& \text{residual scale.}
+\end{align}
+
+The implementation uses conservative defaults:
+\begin{align}
+    \beta &= 0.25, \\
+    \gamma &= 0.05.
+\end{align}
+
+\paragraph{Interpretation}
+\begin{itemize}[leftmargin=*]
+    \item The gain branch is the safe branch. It keeps the inductive bias of the old mask-based generator by scaling content already present in the input.
+    \item The residual branch is the expressive branch. It lets the model add local waveform corrections that are impossible with pure masking.
+\end{itemize}
+
+\paragraph{Why this is a better compromise than direct waveform prediction}
+A direct waveform decoder would use something like:
+\begin{align}
+    x_P = \tanh(W_o * h + b_o),
+\end{align}
+and would not be explicitly anchored to $x_N$. That is much more expressive but also much less constrained. In low-resource or weakly supervised settings this often causes:
+\begin{itemize}[leftmargin=*]
+    \item over-smoothing,
+    \item artifacts,
+    \item instability,
+    \item worse identity preservation.
+\end{itemize}
+
+The hybrid formulation keeps an explicit dependency on $x_N$ while still adding the minimum amount of freedom needed to repair masked-out or distorted content.
+
+\paragraph{Status in the main final baseline}
+This is \textbf{not} used in the main final baseline.
+
+\paragraph{Status in the final hybrid ablation}
+This is the central architectural change of the final hybrid experiment.
+
+\subsection{Why the output scales matter}
+The scales $\beta$ and $\gamma$ are not cosmetic; they encode a prior.
+
+If $\beta$ is too large, then the gain branch can amplify noise aggressively. If $\gamma$ is too large, then the residual branch starts acting like an unconstrained waveform decoder.
+
+Therefore:
+\begin{align}
+    g(t) &\in [1-\beta,\; 1+\beta], \\
+    \delta(t) &\in [-\gamma,\; \gamma].
+\end{align}
+
+With $\beta = 0.25$ and $\gamma = 0.05$, the hybrid generator remains conservative:
+\begin{itemize}[leftmargin=*]
+    \item gain cannot explode,
+    \item additive corrections remain local and low-amplitude,
+    \item optimization is still close to an identity-biased enhancer.
+\end{itemize}
+
+\subsection{When the hybrid generator should help}
+The hybrid generator is most justified when:
+\begin{enumerate}[leftmargin=*]
+    \item WER improvement saturates with a masking-only generator.
+    \item The enhanced waveform remains too similar to the noisy input.
+    \item The degradation removes useful structure instead of merely adding stationary noise.
+    \item The discriminator suggests that stronger quality improvement is possible, but the current generator cannot realize it.
+\end{enumerate}
+
+\subsection{When the hybrid generator may fail}
+The hybrid output can hurt when:
+\begin{enumerate}[leftmargin=*]
+    \item the additive scale is too large,
+    \item adversarial pressure is too high too early,
+    \item paired supervision is too weak,
+    \item evaluation is dominated by low-energy artifacts rather than semantic recovery.
+\end{enumerate}
+
+If the hybrid model becomes unstable, the first things to reduce are:
+\begin{align}
+    \gamma,\quad \beta,\quad \lambda_{adv}.
+\end{align}
+
+\section{WER discriminator architecture}
+The WER discriminator in \texttt{models/wer\_discriminator.py} is a chunked long-form quality estimator.
+
+\subsection{Input processing}
+For a long waveform $x$, the model:
+\begin{enumerate}[leftmargin=*]
+    \item chunks the waveform into overlapping windows,
+    \item converts each chunk into a log-mel representation,
+    \item feeds each chunk through the frozen or partially unfrozen Whisper encoder,
+    \item pools token-level representations into a chunk representation,
+    \item aggregates chunk representations into a waveform-level embedding.
+\end{enumerate}
+
+Let the chunk embeddings be:
+\begin{align}
+    c_1, c_2, \dots, c_K \in \mathbb{R}^{d}.
+\end{align}
+
+Then chunk aggregation can be one of:
+\begin{itemize}[leftmargin=*]
+    \item mean,
+    \item attention,
+    \item mean-topk.
+\end{itemize}
+
+For mean-topk, the model computes a score per chunk, keeps the top difficult chunks, and combines their mean with the global mean. This is useful because WER is often dominated by a few hard local segments rather than by the easiest parts of the recording.
+
+\subsection{Optional auxiliary branches}
+The discriminator supports two optional non-Whisper branches:
+\begin{enumerate}[leftmargin=*]
+    \item a mel-CNN acoustic branch,
+    \item a waveform multi-scale branch.
+\end{enumerate}
+
+The acoustic branch is active in the final acoustic experiments and complements Whisper semantics with local spectral evidence.
+
+\paragraph{Status in the main final baseline}
+The acoustic branch is used. The waveform multi-scale branch is not used.
+
+\subsection{Domain calibration}
+The discriminator also supports domain calibration using duration, RMS, crest factor, and a channel-ID embedding derived from \texttt{CHxx} in the path.
+
+However, empirical runs showed that enabling domain calibration reduced validation correlation in the current setup, so the recommended final configuration disables it.
+
+\paragraph{Status in the main final baseline}
+Not used.
+
+This is consistent with the fact that:
+\begin{itemize}[leftmargin=*]
+    \item \texttt{CHxx} is not the number of physical audio channels,
+    \item all audio streams are mono according to \texttt{ffprobe}/\texttt{librosa},
+    \item the metadata still behaves like a domain tag, but the simple calibration block is not helping enough to justify the extra variance.
+\end{itemize}
+
+\subsection{Output heads}
+The discriminator has two heads:
+\begin{align}
+    s_{abs}(x) &= h_{abs}(f(x)), \\
+    s_{rel}(x) &= h_{rel}(f(x)),
+\end{align}
+where $f(x)$ is the waveform-level embedding.
+
+The absolute head is the main scalar used for calibration and generator guidance in the final setup. The relative head is useful for ranking-focused objectives, but in the observed experiments the absolute head produced better validation correlation.
+
+\paragraph{Status in the main final baseline}
+The absolute head is used for validation selection and for WER-guided finetuning.
+
+\section{Targets for the WER discriminator}
+
+\subsection{Raw WER notation}
+Let $w \ge 0$ denote the WER of a sample, optionally capped:
+\begin{align}
+    w_c = \min(\max(w, 0), w_{\max}).
+\end{align}
+
+\subsection{Quality target}
+The basic quality target is:
+\begin{align}
+    q_T = \frac{1}{1 + w_c}.
+\end{align}
+
+This is monotone, bounded, and interpretable, but it compresses large WER values too aggressively.
+
+\subsection{Z-score target in log-WER space}
+Define:
+\begin{align}
+    x = \log(1 + w_c).
+\end{align}
+Then the calibrated z-target is:
+\begin{align}
+    z_T = -\frac{x - \mu}{\sigma},
+\end{align}
+where $\mu$ and $\sigma$ are robustly estimated from the training set. The negative sign preserves the convention ``higher is better.''
+
+\subsection{Quantile-normal target}
+The final discriminator uses \texttt{target\_mode = quantile\_logwer}. Let $F_{train}$ be the empirical CDF of $x = \log(1+w_c)$ on the training set. Then:
+\begin{align}
+    u &= F_{train}(x), \\
+    z &= \Phi^{-1}(u), \\
+    q_T^{(quant)} &= -z.
+\end{align}
+
+In implementation, the CDF is approximated by a sorted reference vector and bucketization. This transform spreads dense low-WER regions and compresses tail regions in a rank-preserving way.
+
+\paragraph{Why this matters}
+Raw WER is heavy-tailed. Direct regression on WER or even on $\log(1+\text{WER})$ can over-focus on rare extreme samples. The quantile-normal target makes the target distribution more balanced for regression and ranking.
+
+\paragraph{Status in the main final baseline}
+Used.
+
+\section{Losses used by the generator}
+
+\subsection{Pretraining losses}
+During paired pretraining in \texttt{trainers/trainer\_pretrain.py}, the generator minimizes:
+\begin{align}
+    \mathcal{L}_{G}^{pre} = \lambda_{mr}\,\mathcal{L}_{MRSTFT} + \lambda_{si}\,\mathcal{L}_{SI\text{-}SDR} + \lambda_{1}\,\mathcal{L}_{L1}.
+\end{align}
+
+\paragraph{Status in the main final baseline}
+These losses are part of generator pretraining if the pretrain stage is run. They are not the defining novelty of the final experiment, but they remain part of the overall training pipeline.
+
+\paragraph{Status in the final hybrid ablation}
+Used, with paired train-time cropping enabled at 8 seconds. The crop is applied with the same offset to the noisy and clean waveforms, so alignment is preserved while memory usage is reduced.
+
+\subsubsection{Multi-resolution STFT loss}
+For FFT sizes $\{n_r\}_{r=1}^{R}$ and hop sizes $\{h_r\}_{r=1}^{R}$:
+\begin{align}
+    \mathcal{L}_{MRSTFT}(x_P, x_C)
+    = \frac{1}{R}\sum_{r=1}^{R}
+    \left\|\left|\operatorname{STFT}_{n_r,h_r}(x_P)\right| - \left|\operatorname{STFT}_{n_r,h_r}(x_C)\right|\right\|_1.
+\end{align}
+
+\paragraph{Why it matters}
+Waveform-level losses alone are phase-sensitive and can miss spectral detail. MRSTFT encourages correct harmonic and noise patterns across several time-frequency resolutions.
+
+\subsubsection{SI-SDR loss}
+Given centered estimate and target, SI-SDR can be written as:
+\begin{align}
+    s_{target} &= \frac{\langle \hat{x}, x \rangle}{\|x\|^2 + \varepsilon}x, \\
+    e_{noise} &= \hat{x} - s_{target}, \\
+    \mathcal{L}_{SI\text{-}SDR} &= -10\log_{10}\left(\frac{\|s_{target}\|^2 + \varepsilon}{\|e_{noise}\|^2 + \varepsilon}\right).
+\end{align}
+
+\paragraph{Why it matters}
+SI-SDR promotes global waveform fidelity and scale-consistent reconstruction. It complements MRSTFT, which is more local and magnitude-focused.
+
+\subsubsection{L1 waveform loss}
+\begin{align}
+    \mathcal{L}_{L1}(x_P, x_C) = \|x_P - x_C\|_1.
+\end{align}
+
+\paragraph{Why it matters}
+L1 is a stabilizer. It keeps the solution close to the target in sample space and reduces pathological artifacts.
+
+\subsection{Adversarial GAN stage losses}
+The optional GAN stage uses a patch discriminator in \texttt{models/discriminator.py}.
+
+\subsubsection{Discriminator hinge loss}
+For clean audio $x_C$ and fake audio $x_P$:
+\begin{align}
+    \mathcal{L}_{D}^{GAN} = \frac{1}{2}\left[\mathbb{E}\,\max(0, 1 - D_{GAN}(x_C)) + \mathbb{E}\,\max(0, 1 + D_{GAN}(x_P))\right].
+\end{align}
+
+\subsubsection{Generator GAN objective}
+\begin{align}
+    \mathcal{L}_{G}^{GAN} = \mathcal{L}_{MRSTFT} + 0.4\,\mathcal{L}_{SI\text{-}SDR} + 0.1\,\mathcal{L}_{adv}^{GAN},
+\end{align}
+with
+\begin{align}
+    \mathcal{L}_{adv}^{GAN} = -\mathbb{E}\,D_{GAN}(x_P).
+\end{align}
+
+\paragraph{Why this stage is secondary here}
+The final project emphasis is the WER discriminator rather than the GAN discriminator. The GAN stage remains useful as a conventional adversarial baseline, but it is not the core novelty of the final experiment.
+
+\paragraph{Status in the main final baseline}
+Not part of the recommended main final experiment unless explicitly run as a separate baseline.
+
+\section{Losses used by the WER discriminator}
+
+\subsection{Supervised objective}
+The discriminator is trained with a supervised regression term and a ranking term.
+
+\paragraph{Status in the main final baseline}
+Used.
+
+If the target mode is quantile-logWER, the supervised loss is:
+\begin{align}
+    \mathcal{L}_{sup} = \operatorname{SmoothL1}(s_{abs}(x), q_T^{(quant)}).
+\end{align}
+
+In hybrid mode, the code combines a probability-space loss and a logit-space loss:
+\begin{align}
+    \mathcal{L}_{sup}^{hyb} = \lambda_{prob}\,\operatorname{SmoothL1}(\sigma(s_{abs}), q_T) + \lambda_{logit}\,\operatorname{SmoothL1}(s_{abs}, z_T).
+\end{align}
+
+\subsection{Listwise hard-mined ranking loss}
+For a batch of scores $s_i$ and quality targets $q_i$, define valid pairs $(i,j)$ such that $q_i - q_j > \delta_{min}$. For valid pairs, the weighted ranking loss is:
+\begin{align}
+    \mathcal{L}_{rank}
+    = \frac{\sum_{(i,j) \in \mathcal{P}} w_{ij}\,\operatorname{softplus}\big(-(s_i - s_j - m)\big)}{\sum_{(i,j) \in \mathcal{P}} w_{ij}},
+\end{align}
+with
+\begin{align}
+    w_{ij} = (q_i - q_j + 10^{-6})^{p}.
+\end{align}
+
+Only the hardest fraction of pairs is kept when hard mining is enabled.
+
+\paragraph{Why this matters}
+WER prediction is not only about absolute calibration. For generator guidance, preserving correct ordering is often more important than predicting an exact numerical target. Ranking loss directly optimizes that ordering.
+
+\paragraph{Status in the main final baseline}
+Used.
+
+\subsection{Total D\_WER loss}
+The main discriminator objective is:
+\begin{align}
+    \mathcal{L}_{D\_WER} = \lambda_{sup}\,\mathcal{L}_{sup} + \lambda_{rank}\,\mathcal{L}_{rank} + \lambda_{dist}\,\mathcal{L}_{distill} + \lambda_{aux}\,\mathcal{L}_{aux}.
+\end{align}
+
+\subsection{Distillation term}
+If enabled, the discriminator can also be softly tied to the simple quality transform:
+\begin{align}
+    \mathcal{L}_{distill} = \operatorname{SmoothL1}(\sigma(s_{abs}), q_T).
+\end{align}
+
+This is not used in the final recommended setup, but it can stabilize early training if the rank signal is noisy.
+
+\paragraph{Status in the main final baseline}
+Not used.
+
+\subsection{Decoder auxiliary supervision}
+If decoder-ASR statistics are available (for example entropy), the discriminator can regress an auxiliary uncertainty target:
+\begin{align}
+    \mathcal{L}_{aux} = \operatorname{SmoothL1}(\sigma(s_{abs}), q_{aux}).
+\end{align}
+
+This is optional and disabled in the final recommended setting because the main WER-based supervision already captures the priority signal.
+
+\paragraph{Status in the main final baseline}
+Not used.
+
+\subsection{Replay buffer}
+Replay adds additional batches from saved difficult examples. It does not introduce a new formula; it changes the sampling distribution so the model repeatedly sees hard or informative cases.
+
+\paragraph{Why replay helps}
+The in-domain dataset is small. Replay reduces forgetting and stabilizes the ranking signal by revisiting examples that are hard or semantically important.
+
+\paragraph{Status in the main final baseline}
+Used.
+
+\section{Losses used during finetuning}
+During finetuning, the generator no longer has paired clean targets. Therefore training is based on anchors and discriminator guidance.
+
+\subsection{STFT anchor}
+The STFT anchor compares enhanced and noisy audio directly:
+\begin{align}
+    \mathcal{L}_{stft-anchor} = \mathcal{L}_{MRSTFT}(x_P, x_N).
+\end{align}
+
+\paragraph{Why this matters}
+This term is a regularizer, not a denoising target. It prevents the generator from drifting too far away from the input and creating arbitrary artifacts.
+
+\paragraph{Status in the main final baseline}
+Used with a small weight.
+
+\subsection{Identity L1 anchor}
+\begin{align}
+    \mathcal{L}_{id} = \|x_P - x_N\|_1.
+\end{align}
+
+\paragraph{Why it matters}
+This is an even stronger identity bias. In the final configuration it is set to zero because it can over-constrain the generator and suppress useful modifications.
+
+\paragraph{Status in the main final baseline}
+Not used.
+
+\subsection{Semantic anchor}
+The semantic anchor compares Whisper encoder features of noisy and enhanced audio:
+\begin{align}
+    h_N &= E_{Whisper}(\operatorname{Mel}(x_N)), \\
+    h_P &= E_{Whisper}(\operatorname{Mel}(x_P)), \\
+    \mathcal{L}_{sem} &= \|h_P - h_N\|_1.
+\end{align}
+
+\paragraph{Why it matters}
+This penalizes semantic drift. It is useful when the generator starts changing linguistic content rather than only improving intelligibility.
+
+\paragraph{Why it is disabled in the current final config}
+The current runs prioritize conservative acoustic changes and relatively weak adversarial pressure. In that regime, the semantic anchor is not essential and consumes extra memory.
+
+\paragraph{Status in the main final baseline}
+Not used.
+
+\subsection{WER-adversarial objectives}
+The WER adversarial loss uses the discriminator outputs on noisy and enhanced audio.
+
+\subsubsection{Pairwise loss}
+\begin{align}
+    \mathcal{L}_{adv}^{pair} = \operatorname{softplus}\big(-(s(x_P) - s(x_N))\big).
+\end{align}
+
+This simply encourages the enhanced sample to score higher than the noisy one.
+
+\subsubsection{Pairwise margin loss}
+\begin{align}
+    \mathcal{L}_{adv}^{pair-margin} = \operatorname{softplus}\big(-(s(x_P) - s(x_N) - m)\big).
+\end{align}
+
+This requires a relative improvement margin $m$.
+
+\paragraph{Why this is the preferred final form}
+This objective is aligned with the actual task: the enhanced waveform does not need to be universally ``good'' in the abstract; it needs to be better than its own noisy input. This makes the loss less sensitive to absolute miscalibration of the discriminator.
+
+\paragraph{Status in the main final baseline}
+Used.
+
+\subsubsection{Absolute mean loss}
+\begin{align}
+    \mathcal{L}_{adv}^{abs-mean} = -\mathbb{E}[s(x_P)].
+\end{align}
+
+This only pushes the enhanced score upward, regardless of the noisy baseline.
+
+\paragraph{Status in the main final baseline}
+Not used.
+
+\subsubsection{Absolute margin loss}
+Let $q_P = \sigma(s(x_P))$. Then:
+\begin{align}
+    \mathcal{L}_{adv}^{abs-margin} = \mathbb{E}\,\max(0, \tau - q_P).
+\end{align}
+
+This requires the enhanced sample to exceed a fixed target quality threshold $\tau$.
+
+\paragraph{Why we avoid it in the current final setup}
+Absolute margin uses a fixed target. This can be unrealistic for very hard inputs and too weak for easy inputs. It also depends more strongly on absolute score calibration.
+
+\paragraph{Status in the main final baseline}
+Not used.
+
+\subsection{Total finetune objective}
+The finetune stage minimizes:
+\begin{align}
+    \mathcal{L}_{G}^{fine}
+    = \lambda_{stft}\,\mathcal{L}_{stft-anchor}
+    + \lambda_{id}\,\mathcal{L}_{id}
+    + \lambda_{sem}\,\mathcal{L}_{sem}
+    + \lambda_{adv}\,\omega(t)\,\mathcal{L}_{adv}^{WER},
+\end{align}
+where $\omega(t)$ is a warmup factor. In code, warmup is linear after a fixed number of steps.
+
+\paragraph{Status in the main final baseline}
+Used, with the adversarial term active and warm-started.
+
+\paragraph{Why warmup matters}
+Without warmup, the discriminator can dominate the generator before the output waveform is even locally stable. This is especially dangerous with a more expressive output head such as the hybrid generator.
+
+\section{Why the current final settings make sense}
+
+\subsection{Why use the absolute head but pairwise margin loss}
+This is an important design choice.
+
+The discriminator uses the absolute head because empirical validation showed that the absolute head achieves better correlation on the current dataset than the relative head. However, the generator still benefits from a relative objective:
+\begin{align}
+    \mathcal{L}_{adv}^{pair-margin}(x_P, x_N).
+\end{align}
+
+This combination gives the best of both worlds:
+\begin{itemize}[leftmargin=*]
+\item the better calibrated head for scoring,
+\item the more task-aligned loss for enhancement.
+\end{itemize}
+
+\paragraph{Status in the main final baseline}
+This is exactly the final baseline setting.
+
+\subsection{Why train D\_WER with WER filter 20 but G with filter 10}
+The discriminator and the generator do not need the same support.
+
+\paragraph{For D\_WER}
+Using too small a WER filter harms the quantile target reference and compresses the training support too aggressively. Empirically, training D\_WER with filter 20 preserves better correlation than using filter 10.
+
+\paragraph{For G}
+The generator is much more sensitive to extreme outliers because adversarial guidance outside the stable support of the discriminator can destabilize optimization. Therefore it is reasonable to train G on a stricter core subset, for example with filter 10.
+
+This motivates the decoupled design:
+\begin{align}
+    \text{D\_WER filter} &= 20, \\
+    \text{G finetune filter} &= 10.
+\end{align}
+
+\paragraph{Status in the main final baseline}
+Used.
+
+\subsection{Why domain calibration is disabled in the final main experiment}
+The original hypothesis was that \texttt{CHxx} encoded domain information. This is partly true in the operational sense, but the calibration block reduced validation correlation in the observed experiments. Therefore the recommended main experiment disables domain calibration and keeps the simpler discriminator.
+
+\subsection{Why per-sample WER cap is not a training trick}
+Per-sample WER capping in validation is only a reporting safeguard. It prevents averages from being dominated by pathological short references or extreme ASR failures. It does not change generator or discriminator training.
+
+\section{What to avoid}
+\subsection{Avoid an overly strong adversarial weight}
+A large $\lambda_{adv}$ can make the generator chase discriminator preferences too early, producing brittle artifacts. This is particularly risky with hybrid additive freedom.
+
+\subsection{Avoid zero warmup when using expressive outputs}
+If the generator has an additive branch and adversarial pressure begins immediately, the easiest path may be to inject unnatural high-frequency corrections that improve the discriminator score without improving true intelligibility.
+
+\subsection{Avoid pure direct waveform prediction as a first final experiment}
+A fully unconstrained waveform decoder is more likely to require retuning of every loss weight and every stability trick. It is not the right ``last clean experiment'' unless there is enough budget for a full ablation sweep.
+
+\subsection{Avoid coupling D and G to the same outlier policy}
+The discriminator and the generator solve related but different problems. The best support for ranking WER may not be the best support for stable enhancement training.
+
+\section{Recommended experiments}
+\subsection{Stable final baseline}
+Use:
+\begin{itemize}[leftmargin=*]
+    \item \texttt{config.hpc.dwer\_acoustic\_final\_fix.yaml}
+\end{itemize}
+This preserves the legacy mask-residual generator and isolates the new training decisions.
+
+\subsection{Hybrid final experiment}
+Use:
+\begin{itemize}[leftmargin=*]
+    \item \texttt{config.hpc.dwer\_acoustic\_final\_hybrid.yaml}
+\end{itemize}
+This keeps the same discriminator and finetune strategy but replaces the generator output with the hybrid gain+residual form.
+
+\subsection{Commands}
+\begin{lstlisting}[basicstyle=\ttfamily\small,breaklines=true]
+python3 train.py --stage pretrain_discriminator --config config.hpc.dwer_acoustic_final_fix.yaml
+python3 train.py --stage finetune --config config.hpc.dwer_acoustic_final_fix.yaml
+
+python3 train.py --stage pretrain_discriminator --config config.hpc.dwer_acoustic_final_hybrid.yaml
+python3 train.py --stage finetune --config config.hpc.dwer_acoustic_final_hybrid.yaml
+\end{lstlisting}
+
+\section{Implementation summary for the hybrid generator}
+The hybrid generator is configurable via:
+\begin{lstlisting}[basicstyle=\ttfamily\small,breaklines=true]
+models:
+  generator:
+    output_mode: hybrid_gain_residual
+    gain_scale: 0.25
+    residual_scale: 0.05
+\end{lstlisting}
+
+If \texttt{output\_mode = mask\_residual}, the original behavior is preserved.
+
+\section{Final recommendation}
+For a clean paper-quality comparison, the most defensible setup is:
+\begin{enumerate}[leftmargin=*]
+    \item Keep one stable mask-residual baseline.
+    \item Add exactly one architectural change: the hybrid gain+residual generator.
+    \item Keep the discriminator configuration fixed across those two runs.
+    \item Report not only final WER, but also D\_WER validation correlation and stability indicators.
+\end{enumerate}
+
+This gives a clearer scientific story:
+\begin{itemize}[leftmargin=*]
+    \item the discriminator was stabilized and justified,
+    \item the generator expressive bottleneck was identified,
+    \item the hybrid output was introduced as a minimal architectural extension,
+    \item the resulting change can be analyzed without confounding every other design choice.
+\end{itemize}
+
+\end{document}

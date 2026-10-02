@@ -1,0 +1,76 @@
+{
+  "subset": "val",
+  "purpose": "wer_disc",
+  "n": 137,
+  "label_consistency": {
+    "quality_vs_log1pwer": {
+      "pearson": -0.9954064667924776,
+      "spearman": -0.9999953329475234,
+      "n": 137
+    },
+    "quality_vs_neglog1pwer": {
+      "pearson": 0.9954064667924776,
+      "spearman": 1.0,
+      "n": 137
+    },
+    "bootstrap_quality_vs_log1pwer": {
+      "n": 137,
+      "pearson_ci95": [
+        -0.9987664000444997,
+        -0.993841820442016
+      ],
+      "spearman_ci95": [
+        -0.9998833236880914,
+        -0.9996499710642746
+      ]
+    },
+    "bootstrap_quality_vs_neglog1pwer": {
+      "n": 137,
+      "pearson_ci95": [
+        0.993841820442016,
+        0.9987664000444997
+      ],
+      "spearman_ci95": [
+        1.0,
+        1.0
+      ]
+    }
+  },
+  "model": {
+    "checkpoint": "checkpoints/speech_enhancement_hpc/pretrain_discriminator/best.pt",
+    "output_head": "abs",
+    "prob_vs_quality": {
+      "pearson": 0.46686788916524313,
+      "spearman": 0.4923927044635689,
+      "n": 137
+    },
+    "neglogit_vs_log1pwer": {
+      "pearson": 0.46068063677916027,
+      "spearman": 0.4926727276121493,
+      "n": 137
+    },
+    "bootstrap_prob_vs_quality": {
+      "n": 137,
+      "pearson_ci95": [
+        0.2831702646976443,
+        0.6336413085138137
+      ],
+      "spearman_ci95": [
+        0.33572395318012954,
+        0.6262652379263349
+      ]
+    },
+    "bootstrap_neglogit_vs_log1pwer": {
+      "n": 137,
+      "pearson_ci95": [
+        0.2702570266178878,
+        0.6446329640657881
+      ],
+      "spearman_ci95": [
+        0.34135941904530775,
+        0.6349424552429668
+      ]
+    },
+    "gap_to_label_spearman_quality": 0.507607295536431
+  }
+}

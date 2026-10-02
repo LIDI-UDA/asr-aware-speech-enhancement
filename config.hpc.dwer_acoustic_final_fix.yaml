@@ -1,0 +1,150 @@
+experiment_name: speech_enhancement_hpc
+
+paths:
+  processed_data: data/processed
+  checkpoints: checkpoints
+  tensorboard: runs
+
+  # Preprocessing ECU911 train
+  ecu911_audios: data/ecu911/audios
+  ecu911_metadata: data/ecu911/metadata.csv
+
+  # Preprocessing ECU911 test
+  ecu911_test_audios: data/ecu911/test/noise_audios
+  ecu911_test_metadata: data/ecu911/test/metadata.csv
+
+  # SPC (paired corpus)
+  spc_corpus_dir: data/spCSC
+
+devices:
+  # Para HPC 3x RTX A4000; puedes dejar null y usa auto-asignación.
+  train_device: cuda:0
+  whisper_device: cuda:1
+  validate_device: cuda:2
+
+data:
+  num_workers: 8
+  pin_memory: true
+  prefetch_factor: 2
+  ecu911:
+    batch_size: 8
+  spc:
+    batch_size: 8
+
+models:
+  wer_discriminator:
+    freeze_encoder: true
+    unfreeze_last_n_layers: 0
+    encoder_lr_scale: 0.02
+    enable_grad_accum: false
+    target_mode: quantile_logwer
+    loss_mode: relative_listwise
+    sup_weight: 1.0
+    sup_prob_weight: 0.7
+    sup_logit_weight: 0.3
+    rank_weight: 0.2
+    rank_margin: 0.10
+    rank_hard_fraction: 0.5
+    relative_pair_min_delta: 0.01
+    relative_delta_power: 1.0
+    quantile_eps: 0.0001
+    selection_metric: spearman_logwer
+    validation_head: abs
+    use_amp: false
+    grad_clip: 1.0
+    resume_weights_only: false
+    reset_best_on_resume_weights_only: true
+    chunk_seconds: 30.0
+    chunk_overlap_seconds: 3.0
+    chunk_pooling_mode: mean_topk
+    chunk_topk_fraction: 0.25
+    chunk_topk_min: 1
+    use_domain_calibration: false
+    channel_num_buckets: 64
+    channel_embed_dim: 16
+    rel_head_hidden_dim: 192
+    use_acoustic_branch: true
+    acoustic_dim: 64
+    acoustic_chunk_pooling_mode: mean
+
+training:
+  epochs: 10
+  validate_every_epochs: 1
+  grad_accum_steps: 4
+
+wer_discriminator:
+  batch_size: 22
+  stratified_sampling: true
+  strat_high_fraction: 0.5
+  weighted_sampling: false
+  weighted_mode: log1p_wer
+  weighted_alpha: 1.5
+  weighted_power: 1.0
+  weighted_clip_max: 4.0
+  weighted_replacement: true
+  weighted_num_samples: null
+  wer_filter_max_train: 20.0
+  wer_filter_max_eval: 20.0
+  use_replay: true
+  replay_dir: data/replay
+  replay_capacity: 20000
+  replay_batch_size: 16
+  replay_samples_per_epoch: 100
+  replay_stratify: true
+  replay_loss_weight: 0.5
+  replay_start_epoch: 2
+  early_stop_patience: 2
+  early_stop_min_delta: 0.002
+
+evaluation:
+  whisper_model_name: UDA-LIDI/openai-whisper-large-es_ecu911DM
+  max_val_samples: 128
+  quick_val_max_samples: 128
+  full_val_every_epochs: 1
+  force_val_samples: null
+  use_precomputed_noisy_wer: false
+  precomputed_noisy_wer_max: 5.0
+  per_sample_wer_cap: 5.0
+  whisper_chunk_seconds: 30.0
+  whisper_overlap_seconds: 1.0
+  condition_on_prev_tokens: false
+  generator_eval_chunk_seconds: 24.0
+  generator_eval_overlap_seconds: 1.0
+  generator_eval_min_chunk_seconds: 8.0
+  generator_eval_direct_max_seconds: 12.0
+
+preprocessing:
+  compute_decoder_stats: true
+  whisper_model_name: UDA-LIDI/openai-whisper-large-es_ecu911DM
+
+finetune:
+  use_amp: false
+  freeze_werd: true
+  use_wer_adv: true
+  wer_adv_head: abs
+  wer_adv_loss_mode: pairwise_margin
+  wer_adv_pair_margin: 0.03
+  wer_adv_target_quality: 0.60
+  wer_adv_weight: 0.12
+  wer_adv_warmup_steps: 200
+  wer_adv_every_n_steps: 1
+  wer_adv_loss_cap: 0.0
+  wer_adv_auto_disable_without_ckpt: true
+  resume_werd_from_finetune_state: false
+  validate_generator_on_validate_device: true
+  wer_adv_force_fp32: true
+  skip_nonfinite_steps: true
+  train_wer_filter_max: 10.0
+  train_chunk_seconds: 22.0
+  train_chunk_seconds_final: 24.0
+  train_chunk_final_epochs: 2
+  train_random_chunk: true
+  oom_chunk_backoff: 0.90
+  oom_min_chunk_seconds: 16.0
+  werd_chunk_seconds: 30.0
+  werd_chunk_overlap_seconds: 3.0
+  use_semantic_anchor: false
+  semantic_anchor_weight: 0.02
+  semantic_anchor_every_n_steps: 8
+  stft_anchor_weight: 0.03
+  identity_l1_weight: 0.0
