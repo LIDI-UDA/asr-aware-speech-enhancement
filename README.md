@@ -452,7 +452,6 @@ flowchart LR
     G --> H[best finetune ckpt]
 ```
 ### 12.2 Internal Finetune Architecture
-
 ```mermaid
 flowchart TD
     N[Noisy batch] --> G[Generator UNet1D]
