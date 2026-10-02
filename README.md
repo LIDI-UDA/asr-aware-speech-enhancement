@@ -433,23 +433,32 @@ Oscillations in quick-val were observed, including negative gains at some points
 ### 12.1 End-to-End View
 
 ```mermaid
-flowchart LR
-    A[Raw ECU911 + SPC] --> B[preprocessing.py]
-    B --> C1[ecu911_prepared.pkl train/val/test]
-    B --> C2[clean_prepared.pkl train/val]
+flowchart TD
+    N["Noisy batch"] --> G["Generator UNet1D"]
+    G --> E["Enhanced batch"]
 
-    C2 --> D1[Stage pretrain\nGenerator UNet1D]
-    C1 --> D2[Stage pretrain_discriminator\nWERDiscriminator]
+    N --> L1["MRSTFT(enh, noisy)"]
+    E --> L1
+    N --> L2["L1(enh, noisy)"]
+    E --> L2
 
-    D1 --> E1[ckpt pretrain/best.pt]
-    D2 --> E2[ckpt pretrain_discriminator/best.pt]
+    N --> D0["D_WER frozen"]
+    E --> D1["D_WER frozen"]
+    D0 --> A["logits_noisy"]
+    D1 --> B["logits_enh"]
+    A --> ADV["WER-adv loss mode"]
+    B --> ADV
 
-    E1 --> F[Stage finetune]
-    E2 --> F
-    C1 --> F
+    N --> S0["Whisper encoder semantic"]
+    E --> S1["Whisper encoder semantic"]
+    S0 --> SEM["L_semantic"]
+    S1 --> SEM
 
-    F --> G[val quick/full with Whisper long-form]
-    G --> H[best finetune ckpt]
+    L1 --> SUM["Loss total"]
+    L2 --> SUM
+    ADV --> SUM
+    SEM --> SUM
+    SUM --> OPT["Optimizer G"]
 ```
 ### 12.2 Internal Finetune Architecture
 ```mermaid
